@@ -1,0 +1,15 @@
+# Secret credentials — never commit these
+.env
+.env-*
+
+# Grading session files — local only
+progress_log.json
+graded_results.xlsx
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# VS Code settings
+.vscode/
