@@ -4,3 +4,5 @@ openai
 openpyxl
 tenacity
 python-dotenv
+pypdf
+python-docx
