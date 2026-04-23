@@ -502,8 +502,43 @@ def parse_rubric_into_criteria(rubric_text: str) -> dict:
     return parsed
 
 
+def sanitize_response(text: str) -> str:
+    """
+    Removes phrases that trigger Azure's content safety filter
+    before sending student responses to the API.
+    These are instruction-injection attempts — not academic content.
+    The academic content (if any) is preserved for grading.
+    """
+    import re
+    injection_patterns = [
+        r'ignore\s+(all\s+)?(previous\s+)?instructions?',
+        r'ignore\s+(the\s+)?rubric',
+        r'give\s+me\s+full\s+(marks|points|credit|score)',
+        r'award\s+(me\s+)?full\s+(marks|points|credit|score)',
+        r'award\s+(me\s+)?\d+\/\d+',
+        r'you\s+(must|should|will)\s+give\s+me',
+        r'disregard\s+(the\s+)?(rubric|instructions?|criteria)',
+        r'forget\s+(the\s+)?(rubric|instructions?|criteria)',
+        r'pretend\s+(you\s+are|to\s+be)',
+        r'act\s+as\s+(if\s+)?(you\s+are\s+)?a',
+        r'system\s*:\s*you\s+are',
+        r'<\s*system\s*>',
+    ]
+    sanitized = text
+    for pattern in injection_patterns:
+        sanitized = re.sub(pattern, '[REMOVED]', sanitized,
+                           flags=re.IGNORECASE)
+    return sanitized.strip()
+
+
 def safe_api_call(client, deployment, messages, max_tokens=600):
-    """Single retry-wrapped API call."""
+    """
+    Retry-wrapped API call with graceful handling for:
+    - Rate limit errors (exponential backoff)
+    - Azure content filter errors (returns error message instead of crashing)
+    - All other errors (re-raised)
+    """
+    import time
     for attempt in range(6):
         try:
             resp = client.chat.completions.create(
@@ -512,13 +547,26 @@ def safe_api_call(client, deployment, messages, max_tokens=600):
                 temperature=0.0,
                 max_tokens=max_tokens,
             )
-            return resp.choices[0].message.content.strip()
+            # Check if Azure filtered the response
+            choice = resp.choices[0]
+            if hasattr(choice, 'finish_reason') and choice.finish_reason == 'content_filter':
+                return "__CONTENT_FILTERED__"
+            return choice.message.content.strip()
+
         except openai.RateLimitError:
-            import time
             wait = min(4 * (2 ** attempt), 60)
             time.sleep(wait)
+
+        except openai.BadRequestError as e:
+            # Azure content management policy error (400)
+            err_str = str(e).lower()
+            if 'content' in err_str and ('filter' in err_str or 'policy' in err_str or 'management' in err_str):
+                return "__CONTENT_FILTERED__"
+            raise e
+
         except Exception as e:
             raise e
+
     raise openai.RateLimitError("Max retries exceeded")
 
 
@@ -730,10 +778,28 @@ def grade_single_student(client, deployment, parsed_rubric, response_text, max_s
             "criterion_details": [],
         }
 
-    # Handle prompt injection attempts
-    injection_phrases = ["ignore the rubric", "give me full marks",
-                         "award full points", "ignore previous instructions"]
+    # Detect and flag injection attempts, then sanitize before sending to API
+    injection_phrases = [
+        "ignore the rubric", "ignore all instructions", "give me full marks",
+        "award full points", "award me", "ignore previous instructions",
+        "disregard the rubric", "forget the rubric", "pretend you are",
+    ]
     injection_detected = any(p in response_text.lower() for p in injection_phrases)
+
+    # Sanitize removes injection phrases but preserves academic content
+    safe_response = sanitize_response(response_text) if injection_detected else response_text
+
+    # If after sanitization there is barely any academic content left, score 0
+    academic_words = len(safe_response.replace('[REMOVED]', '').strip().split())
+    if academic_words < 5:
+        return {
+            "score":             f"0/{max_score}",
+            "points_awarded":    "",
+            "justification":     "Response contained no gradable academic content — only instructions to manipulate the grader.",
+            "reasoning_summary": "All criteria: 0 points — prompt injection attempt with no academic content.",
+            "full_reasoning":    f"INJECTION ATTEMPT DETECTED. Original response:\n{response_text[:300]}",
+            "criterion_details": [],
+        }
 
     # If rubric was not parsed into criteria (plain text fallback),
     # use the raw rubric with a focused single-pass approach
@@ -741,7 +807,7 @@ def grade_single_student(client, deployment, parsed_rubric, response_text, max_s
         return grade_single_plain_rubric(
             client, deployment,
             parsed_rubric.get("_raw_rubric", str(parsed_rubric)),
-            response_text, max_score, injection_detected
+            safe_response, max_score, injection_detected
         )
 
     criteria   = parsed_rubric.get("criteria", [])
@@ -750,17 +816,28 @@ def grade_single_student(client, deployment, parsed_rubric, response_text, max_s
     floor      = parsed_rubric.get("floor", 0)
     edge_cases = parsed_rubric.get("edge_cases", [])
 
-    # Step 2 — Non-negotiable check
-    nn_result = check_non_negotiables(client, deployment, rules, response_text)
-    score_cap  = nn_result.get("score_cap")
+    # Step 2 — Non-negotiable check (use safe_response)
+    nn_result     = check_non_negotiables(client, deployment, rules, safe_response)
+    score_cap     = nn_result.get("score_cap")
     nn_deductions = nn_result.get("deductions", 0)
 
-    # Step 3 — Grade each criterion independently
+    # Step 3 — Grade each criterion independently (use safe_response)
     criterion_results = []
     for criterion in criteria:
         result = grade_one_criterion(
-            client, deployment, criterion, response_text, edge_cases
+            client, deployment, criterion, safe_response, edge_cases
         )
+        # Handle content filter signal from any criterion call
+        if isinstance(result, str) and result == "__CONTENT_FILTERED__":
+            result = {
+                "label":            criterion["label"],
+                "points_available": criterion["points"],
+                "points_awarded":   0,
+                "tier":             "ZERO",
+                "evidence_quote":   "Content filtered by API",
+                "condition_met":    "Azure content filter triggered",
+                "reasoning":        "Could not grade — content filter. Scored 0.",
+            }
         criterion_results.append(result)
 
     # Step 4 — Aggregate
@@ -783,6 +860,8 @@ def grade_single_student(client, deployment, parsed_rubric, response_text, max_s
 
     # Build reasoning summary
     reasoning_lines = []
+    if injection_detected:
+        reasoning_lines.append("⚠️ Injection attempt detected — academic content graded only")
     if nn_result.get("triggered"):
         for t in nn_result["triggered"]:
             reasoning_lines.append(f"⚠️ Non-negotiable triggered: {t.get('rule','')} → {t.get('action','')}")
@@ -794,9 +873,10 @@ def grade_single_student(client, deployment, parsed_rubric, response_text, max_s
     reasoning_summary = " | ".join(reasoning_lines)
 
     # Full audit trail
-    full_reasoning_lines = [f"=== GRADING AUDIT TRAIL ==="]
+    full_reasoning_lines = ["=== GRADING AUDIT TRAIL ==="]
     if injection_detected:
-        full_reasoning_lines.append("⚠️ PROMPT INJECTION DETECTED — academic content graded only")
+        full_reasoning_lines.append("⚠️ INJECTION ATTEMPT DETECTED — phrases removed, academic content graded only")
+        full_reasoning_lines.append(f"   Sanitized response sent to AI: {safe_response[:200]}")
     if nn_result.get("triggered"):
         full_reasoning_lines.append("\nNON-NEGOTIABLE RULES:")
         for t in nn_result["triggered"]:
@@ -818,8 +898,11 @@ def grade_single_student(client, deployment, parsed_rubric, response_text, max_s
 
     # Step 4 — Generate justification from evidence (not score)
     justification = generate_justification(
-        client, deployment, criterion_results, final_score, max_score, response_text
+        client, deployment, criterion_results, final_score, max_score, safe_response
     )
+    # Handle content filter on justification generation
+    if justification == "__CONTENT_FILTERED__":
+        justification = "Justification could not be generated — content filter triggered. See Full Reasoning for criterion-level details."
 
     return {
         "score":             f"{final_score}/{max_score}",
@@ -1018,35 +1101,85 @@ def run_grading(df, rubric, max_score, client, deployment, output_path, progress
     return df
 
 def parse_uploaded_rubric_with_ai(client, deployment, raw_text):
-    """Use AI to parse any rubric format into structured text."""
-    prompt = """You are a rubric parser. A professor has uploaded their rubric in an unstructured format.
-Your job is to read it and convert it into a clean, structured plain text rubric the AI grader can use.
+    """
+    Use AI to parse any rubric format into a clean structured text the
+    grader can reliably consume. Uses a detailed prompt that handles
+    tables, PDFs, Word docs, and hand-written rubrics.
+    """
+    system_prompt = """You are an expert rubric parser for a university AI grading tool.
+A professor has uploaded their rubric — it may come from a Word document, PDF,
+or plain text and may contain tables, inconsistent formatting, or unclear structure.
 
-Output a clean rubric with these clearly labeled sections:
-- ASSIGNMENT TITLE
-- MAXIMUM SCORE
-- PERFECT RESPONSE DESCRIPTION
-- For each criterion: CRITERION N LABEL, CRITERION N POINTS, CRITERION N FULL CREDIT, CRITERION N PARTIAL CREDIT, CRITERION N ZERO
-- NON-NEGOTIABLE RULES (if any)
-- DEDUCTIONS (if any)
+Your job is to read the full rubric carefully and output it in the EXACT structured
+format below. This output will be fed directly into an AI grading engine, so
+accuracy and completeness are critical.
 
-Be faithful to the original content. Do not add criteria that are not there.
-If information is missing, write "Not specified" for that field.
-Return only the structured rubric text — no preamble."""
+=== OUTPUT FORMAT (copy this structure exactly) ===
+
+ASSIGNMENT TITLE: [extract from rubric or write "Not specified"]
+COURSE: [extract from rubric or write "Not specified"]
+MAXIMUM SCORE: [total points possible as a number, e.g. 10]
+GRADING MODE: INDEPENDENT
+
+PERFECT RESPONSE DESCRIPTION:
+[Write 2-3 sentences describing what a full-marks response contains.
+If the rubric does not include this, infer it from the criteria.]
+
+CRITERION 1 LABEL: [short name for this criterion]
+CRITERION 1 POINTS: [number of points]
+CRITERION 1 FULL CREDIT:
+[Describe exactly what must be present for full marks. Use IF/THEN language.
+Be specific — name the elements, not the quality.]
+CRITERION 1 PARTIAL CREDIT:
+[Describe what earns partial marks. State the exact number of points.]
+CRITERION 1 ZERO:
+[Describe what earns zero. This is required — never leave blank.]
+CRITERION 1 NOTES:
+[Any edge cases, exceptions, or special grading instructions. Write NONE if absent.]
+
+[Repeat CRITERION blocks for each criterion found in the rubric]
+
+NON-NEGOTIABLE RULES:
+[List any hard rules like minimum word counts or citation requirements.
+Format: "Rule N — [condition]: [action if triggered]"
+Write NONE if no such rules exist.]
+
+DEDUCTIONS:
+[List any point deductions with triggers, amounts, and caps.
+Write NONE if no deductions exist.]
+
+FLOOR RULE: [minimum possible score after deductions, e.g. 0]
+
+EDGE CASES:
+[Any other special grading instructions not captured above.
+Write NONE if absent.]
+
+=== CRITICAL RULES FOR PARSING ===
+1. Extract ALL criteria — do not skip any even if they look similar.
+2. If the rubric uses a table, read each row/column carefully —
+   rows are usually criteria, columns are usually score levels.
+3. If score levels use labels like Excellent/Good/Fair/Poor, map them to
+   Full Credit / Partial Credit / Zero as best you can.
+4. If the rubric has sub-points (A, B, C, D), group them logically into
+   criteria with full/partial/zero conditions.
+5. Preserve the professor's exact language where possible — do not paraphrase
+   or simplify the grading conditions.
+6. Never invent criteria that are not in the rubric.
+7. If the maximum score is unclear, add up all criterion points."""
 
     try:
         completion = client.chat.completions.create(
             model=deployment,
             messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user",   "content": f"Parse this rubric:\n\n{raw_text[:8000]}"},
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": f"Parse this rubric completely and accurately:\n\n{raw_text[:10000]}"},
             ],
-            temperature=0.1,
-            max_tokens=2000,
+            temperature=0.0,
+            max_tokens=3000,
         )
         return completion.choices[0].message.content.strip()
     except Exception as e:
-        return None, str(e)
+        return None
 
 def assemble_rubric_from_form(fields):
     """Convert form fields dict into structured rubric text."""
@@ -1143,7 +1276,13 @@ with tab1:
             <strong>How this works:</strong> Upload your rubric in any format —
             Word, PDF, or plain text. The AI will read it, extract your grading
             criteria, and convert it into a clean structured format ready for
-            bulk grading. You can review and edit before proceeding.
+            bulk grading. You can review and edit before proceeding.<br><br>
+            ⚠️ <strong>Important:</strong> If your rubric is a Word document,
+            write your criteria as plain paragraphs — not inside tables.
+            Tables in Word documents lose their structure when read by the AI
+            and produce unreliable results. If your rubric uses tables,
+            copy the content into plain text before uploading, or use the
+            <strong>Build from scratch</strong> option instead.
         </div>
         """, unsafe_allow_html=True)
 
@@ -1215,21 +1354,33 @@ with tab1:
                         raw_text = ""
 
                 if raw_text:
-                    st.success(f"✅ File read successfully — {len(raw_text.split())} words extracted")
+                    word_count = len(raw_text.split())
+                    if word_count < 200:
+                        st.warning(
+                            f"⚠️ Only **{word_count} words** extracted. This seems low for a rubric. "
+                            f"If your Word document uses tables for the criteria, the content may not "
+                            f"have been fully captured. Check the preview below and consider using "
+                            f"the **Build from scratch** option instead."
+                        )
+                    else:
+                        st.success(f"✅ File read successfully — {word_count} words extracted")
 
                     with st.expander("Preview extracted text", expanded=False):
                         st.text(raw_text[:2000] + ("..." if len(raw_text) > 2000 else ""))
 
                     if st.button("🤖  Parse Rubric with AI", type="primary", use_container_width=True):
-                        with st.spinner("Reading your rubric and extracting grading criteria..."):
+                        with st.spinner("Reading your rubric and extracting all grading criteria — this takes about 15 seconds..."):
                             parsed = parse_uploaded_rubric_with_ai(client, AZURE_DEPLOYMENT, raw_text)
                             if parsed:
                                 st.session_state.rubric_text   = parsed
                                 st.session_state.rubric_ready  = True
                                 st.session_state.rubric_source = f"Parsed from: {uploaded_rubric.name}"
-                                st.success("✅ Rubric parsed successfully! Review it below.")
+                                # Count how many criteria were found
+                                import re as _re
+                                n_found = len(_re.findall(r'CRITERION \d+ LABEL:', parsed))
+                                st.success(f"✅ Rubric parsed — **{n_found} criteria found**. Review below before proceeding.")
                             else:
-                                st.error("Could not parse the rubric. Try the manual form instead.")
+                                st.error("Could not parse the rubric. Try copying the content into the Build from scratch form instead.")
 
             except Exception as e:
                 st.error(f"Could not read file: {e}")
@@ -1237,22 +1388,47 @@ with tab1:
         # Show parsed rubric for review
         if st.session_state.rubric_ready and st.session_state.rubric_source.startswith("Parsed"):
             st.markdown("---")
-            st.markdown("**Review your parsed rubric** — edit if anything looks wrong, then proceed to Step 2.")
+
+            # Quality check — warn if criteria look incomplete
+            import re as _re
+            parsed_text = st.session_state.rubric_text
+            n_criteria  = len(_re.findall(r'CRITERION \d+ LABEL:', parsed_text))
+            n_zero      = len(_re.findall(r'CRITERION \d+ ZERO:', parsed_text))
+            n_full      = len(_re.findall(r'CRITERION \d+ FULL CREDIT:', parsed_text))
+
+            if n_criteria == 0:
+                st.error(
+                    "❌ No criteria were found in the parsed rubric. "
+                    "This usually means the rubric was in a table format that could not be read correctly. "
+                    "Please use the **Build from scratch** option and enter your criteria manually."
+                )
+            else:
+                if n_zero < n_criteria or n_full < n_criteria:
+                    st.warning(
+                        f"⚠️ **{n_criteria} criteria found** but some may be incomplete "
+                        f"({n_full} full credit conditions, {n_zero} zero conditions). "
+                        f"Review carefully and fill in any missing sections before grading."
+                    )
+                else:
+                    st.success(f"✅ **{n_criteria} criteria** parsed with full/partial/zero conditions.")
+
+            st.markdown("**Review your parsed rubric** — edit anything that looks wrong, then proceed to Step 2.")
             edited = st.text_area(
                 "Parsed Rubric",
-                value=st.session_state.rubric_text,
-                height=400,
+                value=parsed_text,
+                height=450,
                 label_visibility="collapsed",
             )
             if edited != st.session_state.rubric_text:
                 st.session_state.rubric_text = edited
 
-            st.markdown("""
-            <div class="card-green">
-                ✅ <strong>Rubric is ready.</strong>
-                Go to <strong>Step 2 — Grade Responses</strong> to upload your student file and start grading.
-            </div>
-            """, unsafe_allow_html=True)
+            if n_criteria > 0:
+                st.markdown("""
+                <div class="card-green">
+                    ✅ <strong>Rubric is ready.</strong>
+                    Go to <strong>Step 2 — Grade Responses</strong> to upload your student file and start grading.
+                </div>
+                """, unsafe_allow_html=True)
 
     # ── PATH B: BUILD FROM FORM ──────────────────────────────────
     else:
@@ -1468,10 +1644,21 @@ with tab2:
 
         with col_upload:
             st.markdown('<div class="step-pill">📂 Upload Student Responses</div>', unsafe_allow_html=True)
+
+            st.markdown("""
+            <div class="card-green">
+                <strong>Required Excel format — three columns in this exact order:</strong><br>
+                <code>Student_ID</code> &nbsp;|&nbsp; <code>Student_Name</code> &nbsp;|&nbsp; <code>Student_Response</code><br><br>
+                ⚠️ Column names must match exactly (case-sensitive).<br>
+                ⚠️ Do not add extra columns, merged cells, or formatting.<br>
+                ⚠️ One student per row. No blank rows between students.
+            </div>
+            """, unsafe_allow_html=True)
+
             uploaded_xlsx = st.file_uploader(
-                "Excel file (.xlsx)",
+                "Upload your Excel file (.xlsx)",
                 type=["xlsx"],
-                help="Must contain columns: Student_Name, Student_ID, Student_Response"
+                help="Required columns in order: Student_ID, Student_Name, Student_Response"
             )
             if uploaded_xlsx:
                 try:
@@ -1479,10 +1666,16 @@ with tab2:
                     required = {"Student_Name", "Student_ID", "Student_Response"}
                     missing  = required - set(preview_df.columns)
                     if missing:
-                        st.error(f"Missing columns: {', '.join(missing)}")
+                        st.error(
+                            f"❌ Missing column(s): **{', '.join(missing)}**. "
+                            f"Your file must have exactly these three columns: "
+                            f"`Student_ID`, `Student_Name`, `Student_Response`."
+                        )
                     else:
                         st.success(f"✅ {len(preview_df)} student responses loaded")
-                        st.dataframe(preview_df[["Student_Name", "Student_ID", "Student_Response"]].head(3), use_container_width=True)
+                        # Always show in the required order
+                        show_cols = ["Student_ID", "Student_Name", "Student_Response"]
+                        st.dataframe(preview_df[show_cols].head(3), use_container_width=True)
                 except Exception as e:
                     st.error(f"Could not read file: {e}")
 
